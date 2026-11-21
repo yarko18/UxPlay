@@ -105,6 +105,7 @@ static raop_t *raop = NULL;
 static logger_t *render_logger = NULL;
 static bool audio_sync = false;
 static bool video_sync = true;
+static bool mirror_low_latency = false;
 static int64_t audio_delay_alac = 0;
 static int64_t audio_delay_aac = 0;
 static bool relaunch_video = false;
@@ -1129,6 +1130,7 @@ static void print_info (char *name) {
     printf("-vsync [x]Mirror mode: sync audio to video using timestamps (default)\n");
     printf("          x is optional audio delay: millisecs, decimal, can be neg.\n");
     printf("-vsync no Switch off audio/(server)video timestamp synchronization \n");
+    printf("-low-latency Limit decoded Mirror-mode queue to two frames\n");
     printf("-async [x]Audio-Only mode: sync audio to client video (default: no)\n");
     printf("-async no Switch off audio/(client)video timestamp synchronization\n");
     printf("-db l[:h] Set minimum volume attenuation to l dB (decibels, negative);\n");
@@ -1741,6 +1743,8 @@ static void parse_arguments (int argc, char *argv[]) {
                     }
                 }
             }
+        } else if (arg == "-low-latency") {
+            mirror_low_latency = true;
         } else if (arg == "-s") {
             if (!option_has_value(i, argc, argv[i], argv[i+1])) exit(1);
             std::string value(argv[++i]);
@@ -2614,7 +2618,7 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
             video_renderer_destroy();
             video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(), rtp_pipeline.c_str(),
                                 video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
-                                videosink_options.c_str(), fullscreen, video_sync, h265_support,
+                                videosink_options.c_str(), fullscreen, video_sync, mirror_low_latency, h265_support,
                                 render_coverart, playbin_version, NULL);
             video_renderer_start();
             close_window = false;  // we already closed the window
@@ -3677,7 +3681,7 @@ int main (int argc, char *argv[]) {
     if (use_video) {
         video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(), rtp_pipeline.c_str(),
                             video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
-                            videosink_options.c_str(), fullscreen, video_sync, h265_support,
+                            videosink_options.c_str(), fullscreen, video_sync, mirror_low_latency, h265_support,
                             render_coverart, playbin_version, NULL);
         video_renderer_start();
 #ifdef __OpenBSD__
@@ -3785,7 +3789,7 @@ int main (int argc, char *argv[]) {
             const char *uri = (url.empty() ? NULL : url.c_str());
             video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(),rtp_pipeline.c_str(),
                                 video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
-                                videosink_options.c_str(), fullscreen, video_sync, h265_support,
+                                videosink_options.c_str(), fullscreen, video_sync, mirror_low_latency, h265_support,
                                 render_coverart, playbin_version, uri);
             full_video_reset = false;
             video_renderer_start();

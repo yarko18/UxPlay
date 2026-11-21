@@ -1350,6 +1350,12 @@ timestamps: this mode is appropriate for "live streaming" such as using
 UxPlay as a second monitor for a mac computer, or monitoring a webcam;
 with it, no video frames are dropped.
 
+**-low-latency** (In Mirror mode:) adds a decoded-video queue limited to two
+frames and discards its oldest frame if conversion or display cannot keep up.
+This prevents delay from growing continuously on lower-power receivers without
+discarding H.264 reference frames.  It is intended for interactive mirroring,
+usually together with `-vsync no`.
+
 **-async \[x\]** (In Audio-Only (ALAC) mode:) this option uses
 timestamps to synchronize audio on the server with video on the client,
 with an optional audio delay in (decimal) milliseconds (*x* = "20.5"

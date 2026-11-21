@@ -266,7 +266,7 @@ g_string_replace (GString     *string,
 
 void video_renderer_init(logger_t *render_logger, const char *server_name, videoflip_t videoflip[2], const char *parser, const char * rtp_pipeline,
                           const char *decoder, const char *converter, const char *videosink, const char *videosink_options, 
-                          bool initial_fullscreen, bool video_sync, bool h265_support, bool coverart_support, guint playbin_version, const char *uri) {
+                          bool initial_fullscreen, bool video_sync, bool low_latency, bool h265_support, bool coverart_support, guint playbin_version, const char *uri) {
     GError *error = NULL;
     GstCaps *caps = NULL;
     bool rtp = (bool) strlen(rtp_pipeline);
@@ -382,6 +382,12 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
                 g_string_append(launch, " ! ");
                 if (!rtp) {
                     g_string_append(launch, decoder);
+                    if (low_latency) {
+                        /* Drop only decoded frames.  Dropping encoded H.264 access
+                         * units can remove reference frames and corrupt every
+                         * dependent frame until the next IDR. */
+                        g_string_append(launch, " ! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream");
+                    }
                 } else {
                     g_string_append(launch, "rtph264pay ");
                     g_string_append(launch, rtp_pipeline);
