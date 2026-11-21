@@ -186,6 +186,7 @@ static bool h265_support = false;
 static int n_video_renderers = 0;
 static int n_audio_renderers = 0;
 static bool hls_support = false;
+static bool hls_single_variant = false;
 static std::string lang_requested = "";
 static std::string lang_subtitles = "";
 static std::string lang_system = "";
@@ -1111,6 +1112,7 @@ static void print_info (char *name) {
     printf("          n=1,2,.. format = H264/5, ALAC/AAC. Default fn=\"recording\"\n");
     printf("-hls [v]  Support HTTP Live Streaming (HLS), Youtube app video only: \n");
     printf("          v = 2 or 3 (default 3) optionally selects video player version\n");
+    printf("-hls-single Keep only the best eligible HLS video variant for fast startup\n");
     printf("-lang ... Ranked HLS language preferences (\"fr:pt-BR:..\");\" \" = none\n");
     printf("-slang ...Ranked HLS subtitle language preferences (overrides -lang)\n");
     printf("-custom s Restrict HLS resolutions by codec (useful on low-power hosts)\n");
@@ -2212,6 +2214,9 @@ static void parse_arguments (int argc, char *argv[]) {
                 }
                 playbin_version = (guint) n;
             }
+        } else if (arg == "-hls-single") {
+            hls_support = true;
+            hls_single_variant = true;
         } else if (arg == "-lang") {
             lang_requested.erase();
             if (i < argc - 1 && *argv[i+1] != '-') {
@@ -3091,6 +3096,10 @@ extern "C" void get_custom_profile(void *cls, const char **custom_profile) {
     *custom_profile = (custom_profile_string.empty() ? NULL : custom_profile_string.c_str());
 }
 
+extern "C" bool get_hls_single_variant(void *cls) {
+    return hls_single_variant;
+}
+
 extern "C" void on_video_play(void *cls, const char* location, const float start_position) {
     /* start_position needs to be implemented */
     video_renderer_set_start(start_position);
@@ -3214,6 +3223,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_cbs.video_reset = video_reset;
     raop_cbs.video_set_codec_and_size = video_set_codec_and_size;
     raop_cbs.get_custom_profile = get_custom_profile;
+    raop_cbs.get_hls_single_variant = get_hls_single_variant;
 #ifdef DBUS
     raop_cbs.mirror_video_running = mirror_video_running;
 #endif

@@ -621,6 +621,11 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
             int num_uri = 0;
             char *uri_local_prefix = get_uri_local_prefix(airplay_video);
             playlist = select_master_playlist_language(airplay_video, playlist);
+            if (raop->callbacks.get_hls_single_variant &&
+                raop->callbacks.get_hls_single_variant(raop->callbacks.cls) &&
+                !select_best_master_playlist_stream(&playlist, raop->logger)) {
+                logger_log(raop->logger, LOGGER_ERR, "failed to select a single HLS video variant");
+            }
             playlist_len = strlen(playlist);
             create_media_uri_table(uri_prefix, playlist, playlist_len, &uri_list, &num_uri);	
             char *new_master = adjust_master_playlist (playlist, playlist_len,  uri_prefix, uri_local_prefix);

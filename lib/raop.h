@@ -120,6 +120,7 @@ struct raop_callbacks_s {
     void  (*on_video_acquire_playback_info) (void *cls, playback_info_t *playback_video);
     float  (*on_video_playlist_remove) (void *cls);
     void  (*get_custom_profile) (void *cls, const char **custom_profile);
+    bool  (*get_hls_single_variant) (void *cls);
 };
 
 typedef struct raop_callbacks_s raop_callbacks_t;

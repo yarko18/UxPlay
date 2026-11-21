@@ -663,11 +663,21 @@ static slice_t *master_playlist_slicer(const char *master_playlist, airplay_vide
         available_list = unpack_list(available,',',&n_list);
         assert(n_list == n_items);
         if (autoselect) {
-            selected = match_language(lang_list, n_lang, available_list, n_list, NULL);
-            if (!selected && type == 'a') {
+            /* The sender marks its selected HLS audio rendition DEFAULT=YES.
+             * Unless -lang explicitly overrides it, preserve that selection
+             * instead of replacing it with the receiver host locale. */
+            if (type == 'a' && !n_lang_requested && default_lang) {
                 selected = default_lang;
                 audio_lang_default_selected = true;
                 *subtitles = true;
+                printf("using sender-selected default HLS audio language: %s\n", selected);
+            } else {
+                selected = match_language(lang_list, n_lang, available_list, n_list, NULL);
+                if (!selected && type == 'a') {
+                    selected = default_lang;
+                    audio_lang_default_selected = true;
+                    *subtitles = true;
+                }
             }
         } else {
             selected = strict_match_language(lang_list, n_lang, available_list, n_list);
@@ -1017,7 +1027,12 @@ static bool keep_stream(const char *info_line, const char *custom_profile_string
     if (get_attr_value(info_line, "RESOLUTION=", res_str, sizeof(res_str))) {
         char *x = strchr(res_str, 'x');
         if (x) {
-            height = atoi(x + 1);
+            *x = '\0';
+            int width = atoi(res_str);
+            int frame_height = atoi(x + 1);
+            /* HLS quality is the shorter frame dimension. This treats
+             * 1920x1080 and portrait 1080x1920 as the same 1080p tier. */
+            height = width < frame_height ? width : frame_height;
         }
     }
     
@@ -1131,6 +1146,92 @@ bool filter_master_playlist(char **master_playlist_ptr, const char * custom_prof
     }   
     free (orig);
     *master_playlist_ptr = filtered;
+    return true;
+}
+
+/* Keep only the highest-resolution video variant left after profile and
+ * language filtering.  Audio/subtitle renditions are retained, so playbin can
+ * still select the media referenced by the chosen stream.  This reduces the
+ * number of serial FCUP playlist requests and avoids client startup timeouts. */
+bool select_best_master_playlist_stream(char **master_playlist_ptr, logger_t *logger) {
+    char *playlist = *master_playlist_ptr;
+    char *best = NULL;
+    uint64_t best_pixels = 0;
+    unsigned long long best_bandwidth = 0;
+
+    for (char *line = playlist; line && *line;) {
+        char *line_end = strchr(line, '\n');
+        if (!line_end) {
+            break;
+        }
+        char *next = line_end + 1;
+        if (!strncmp(line, "#EXT-X-STREAM-INF:", strlen("#EXT-X-STREAM-INF:"))) {
+            char resolution[32] = {0};
+            char bandwidth[32] = {0};
+            unsigned int width = 0;
+            unsigned int height = 0;
+            unsigned long long pixels = 0;
+            unsigned long long bitrate = 0;
+
+            if (get_attr_value(line, "RESOLUTION=", resolution, sizeof(resolution)) &&
+                sscanf(resolution, "%ux%u", &width, &height) == 2) {
+                pixels = (unsigned long long) width * height;
+            }
+            if (get_attr_value(line, "BANDWIDTH=", bandwidth, sizeof(bandwidth))) {
+                bitrate = strtoull(bandwidth, NULL, 10);
+            }
+            if (!best || pixels > best_pixels ||
+                (pixels == best_pixels && bitrate > best_bandwidth)) {
+                best = line;
+                best_pixels = pixels;
+                best_bandwidth = bitrate;
+            }
+            char *uri_end = strchr(next, '\n');
+            line = uri_end ? uri_end + 1 : next + strlen(next);
+        } else {
+            line = next;
+        }
+    }
+
+    if (!best) {
+        logger_log(logger, LOGGER_ERR, "HLS single-variant selection found no video stream");
+        return false;
+    }
+
+    size_t len = strlen(playlist);
+    char *selected = (char *) malloc(len + 1);
+    if (!selected) {
+        logger_log(logger, LOGGER_ERR, "HLS single-variant selection failed to allocate memory");
+        return false;
+    }
+
+    char *write = selected;
+    for (char *line = playlist; line && *line;) {
+        char *line_end = strchr(line, '\n');
+        char *next = line_end ? line_end + 1 : line + strlen(line);
+        if (!strncmp(line, "#EXT-X-STREAM-INF:", strlen("#EXT-X-STREAM-INF:"))) {
+            char *uri_end = strchr(next, '\n');
+            char *pair_end = uri_end ? uri_end + 1 : next + strlen(next);
+            if (line == best) {
+                size_t pair_len = (size_t) (pair_end - line);
+                memcpy(write, line, pair_len);
+                write += pair_len;
+            }
+            line = pair_end;
+        } else {
+            size_t line_len = (size_t) (next - line);
+            memcpy(write, line, line_len);
+            write += line_len;
+            line = next;
+        }
+    }
+    *write = '\0';
+
+    logger_log(logger, LOGGER_INFO,
+               "HLS single-variant selection kept %llu pixels at %llu bit/s",
+               (unsigned long long) best_pixels, best_bandwidth);
+    free(playlist);
+    *master_playlist_ptr = selected;
     return true;
 }
 
