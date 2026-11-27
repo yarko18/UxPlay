@@ -452,6 +452,24 @@ executable can also be found in the build directory after the build
 process, if you wish to test before installing (in which case the
 GStreamer plugins must first be installed).
 
+### Reproducible Linux packages in this fork
+
+This fork provides containerized Debian Bookworm builds for both supported
+CPU architectures:
+
+```sh
+./compile_linux.sh --arch arm64
+./compile_linux.sh --arch amd64
+```
+
+The aliases `aarch64` and `x86_64` are accepted. `compile_linux.sh` is the
+single build entry point; packages are written to `dist/`.
+
+The AMD64 package includes `uxplay-home`, a headless launcher which may start
+before HDMI is connected. It waits for DRM/ELD hot-plug and restarts only
+UxPlay when the display is disconnected and reconnected; the computer does
+not need to be rebooted. See `scripts/linux-amd64/README-HOMESERVER.md`.
+
 ### Building on non-Debian Linux and \*BSD
 
 \*\*For those with RPM-based distributions, a RPM spec file uxplay.spec

@@ -1,0 +1,530 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ -x "$script_dir/bin/uxplay" ]]; then
+    uxplay_bin="$script_dir/bin/uxplay"
+elif command -v uxplay >/dev/null 2>&1; then
+    uxplay_bin="$(command -v uxplay)"
+else
+    echo "UxPlay binary not found in $script_dir/bin or PATH" >&2
+    exit 127
+fi
+
+if [[ -w "$script_dir" ]]; then
+    default_log="$script_dir/uxplay.log"
+else
+    default_log="$PWD/uxplay.log"
+fi
+log_file="${UXPLAY_LOG_FILE:-$default_log}"
+poll_seconds="${UXPLAY_DISPLAY_POLL_SECONDS:-2}"
+require_hdmi_audio="${UXPLAY_REQUIRE_HDMI_AUDIO:-1}"
+video_sink="${UXPLAY_VIDEO_SINK:-kmssink}"
+decoder_request="${UXPLAY_DECODER:-auto}"
+drm_root="${UXPLAY_DRM_ROOT:-/sys/class/drm}"
+asound_root="${UXPLAY_ASOUND_ROOT:-/proc/asound}"
+dri_root="${UXPLAY_DRI_ROOT:-/dev/dri}"
+
+if [[ ! "$poll_seconds" =~ ^[1-9][0-9]*$ ]]; then
+    echo "UXPLAY_DISPLAY_POLL_SECONDS must be a positive integer." >&2
+    exit 2
+fi
+if [[ "$require_hdmi_audio" != "0" && "$require_hdmi_audio" != "1" ]]; then
+    echo "UXPLAY_REQUIRE_HDMI_AUDIO must be 0 or 1." >&2
+    exit 2
+fi
+
+debug=false
+diagnose_only=false
+wait_for_display=true
+forward_args=()
+
+while (($#)); do
+    case "$1" in
+        --debug|-g)
+            debug=true
+            ;;
+        --diagnose|--check)
+            diagnose_only=true
+            ;;
+        --no-wait)
+            wait_for_display=false
+            ;;
+        --)
+            shift
+            forward_args+=("$@")
+            break
+            ;;
+        *)
+            forward_args+=("$1")
+            ;;
+    esac
+    shift
+done
+
+video_levels=(240 360 480 720 1080)
+connector=""
+drm_device=""
+display_name="disconnected"
+display_max_width=0
+display_max_height=0
+display_max_pixels=0
+display_max_short_side=0
+eld_file=""
+monitor_name="unavailable"
+alsa_device=""
+alsa_pcm_status=""
+decoder=""
+decoder_description="unavailable"
+decoder_args=()
+runtime_errors=()
+child_pid=""
+
+min_int() {
+    if (($1 < $2)); then
+        echo "$1"
+    else
+        echo "$2"
+    fi
+}
+
+highest_video_level() {
+    local limit="$1"
+    local selected=0
+    local level
+    for level in "${video_levels[@]}"; do
+        if ((level <= limit)); then
+            selected="$level"
+        fi
+    done
+    echo "$selected"
+}
+
+video_width_for_height() {
+    case "$1" in
+        240) echo 426 ;;
+        360) echo 640 ;;
+        480) echo 854 ;;
+        720) echo 1280 ;;
+        1080) echo 1920 ;;
+        *) return 1 ;;
+    esac
+}
+
+eld_is_valid() {
+    local candidate="$1"
+    [[ -r "$candidate" ]] || return 1
+    awk '
+        $1 == "monitor_present" && $2 == "1" { present = 1 }
+        $1 == "eld_valid" && $2 == "1" { valid = 1 }
+        END { exit !(present && valid) }
+    ' "$candidate"
+}
+
+alsa_device_from_eld() {
+    local candidate="$1"
+    local card_number card_id pcm_device
+
+    card_number="${candidate#"$asound_root/card"}"
+    card_number="${card_number%%/*}"
+    card_id="$(<"$asound_root/card${card_number}/id")"
+    pcm_device="${candidate##*.}"
+
+    # The suffix in /proc/asound/cardN/eld#codec.PCM is the exact hardware
+    # PCM number.  Use plughw so GStreamer can negotiate the stream format
+    # while still targeting the HDMI endpoint that supplied this ELD.
+    printf 'plughw:CARD=%s,DEV=%s\n' "$card_id" "$pcm_device"
+}
+
+alsa_status_from_eld() {
+    local candidate="$1"
+    local card_number pcm_device
+
+    card_number="${candidate#"$asound_root/card"}"
+    card_number="${card_number%%/*}"
+    pcm_device="${candidate##*.}"
+    printf '%s/card%s/pcm%sp/sub0/status\n' \
+        "$asound_root" "$card_number" "$pcm_device"
+}
+
+select_decoder() {
+    decoder_args=()
+    case "$decoder_request" in
+        auto)
+            if gst-inspect-1.0 vah264dec >/dev/null 2>&1; then
+                decoder="vah264dec"
+                decoder_description="Intel/VA H.264 hardware decoder"
+                decoder_args=(-vd "$decoder")
+            elif gst-inspect-1.0 vaapih264dec >/dev/null 2>&1; then
+                decoder="vaapih264dec"
+                decoder_description="VA-API H.264 hardware decoder"
+                decoder_args=(-vd "$decoder")
+            elif gst-inspect-1.0 avdec_h264 >/dev/null 2>&1; then
+                decoder="avdec_h264"
+                decoder_description="software H.264 decoder"
+                decoder_args=(-avdec)
+            else
+                decoder=""
+                decoder_description="no H.264 decoder found"
+            fi
+            ;;
+        avdec_h264)
+            if gst-inspect-1.0 avdec_h264 >/dev/null 2>&1; then
+                decoder="avdec_h264"
+                decoder_description="software H.264 decoder (forced)"
+                decoder_args=(-avdec)
+            else
+                decoder=""
+                decoder_description="requested avdec_h264 is unavailable"
+            fi
+            ;;
+        *)
+            if gst-inspect-1.0 "$decoder_request" >/dev/null 2>&1; then
+                decoder="$decoder_request"
+                decoder_description="$decoder_request (forced)"
+                decoder_args=(-vd "$decoder")
+            else
+                decoder=""
+                decoder_description="requested $decoder_request is unavailable"
+            fi
+            ;;
+    esac
+}
+
+validate_runtime() {
+    local video_element="${video_sink%% *}"
+    local audio_owner audio_state drm_group
+    runtime_errors=()
+
+    if ! command -v gst-inspect-1.0 >/dev/null 2>&1; then
+        runtime_errors+=(
+            "gst-inspect-1.0 is missing (Debian package: gstreamer1.0-tools)"
+        )
+        return 1
+    fi
+
+    select_decoder
+    if [[ -z "$decoder" ]]; then
+        runtime_errors+=(
+            "no H.264 decoder is available (install gstreamer1.0-libav or gstreamer1.0-vaapi)"
+        )
+    fi
+    if ! gst-inspect-1.0 "$video_element" >/dev/null 2>&1; then
+        runtime_errors+=(
+            "video sink '$video_element' is unavailable (kmssink is in gstreamer1.0-plugins-bad)"
+        )
+    fi
+    if [[ "$video_element" == "kmssink" ]]; then
+        if [[ -z "$drm_device" || ! -e "$drm_device" ]]; then
+            runtime_errors+=("no DRM card device is available under $dri_root")
+        elif [[ ! -r "$drm_device" || ! -w "$drm_device" ]]; then
+            drm_group="$(stat -c '%G' "$drm_device" 2>/dev/null || echo unknown)"
+            runtime_errors+=(
+                "no read/write access to $drm_device (device group: $drm_group)"
+            )
+        fi
+    fi
+    if [[ "$require_hdmi_audio" == "1" ]] && \
+       ! gst-inspect-1.0 alsasink >/dev/null 2>&1; then
+        runtime_errors+=(
+            "alsasink is unavailable (Debian package: gstreamer1.0-alsa)"
+        )
+    fi
+    if [[ "$require_hdmi_audio" == "1" && \
+          -z "${UXPLAY_ALSA_DEVICE:-}" && \
+          -r "$alsa_pcm_status" ]]; then
+        audio_state="$(awk -F ': *' '$1 == "state" { print $2; exit }' \
+            "$alsa_pcm_status")"
+        if [[ -n "$audio_state" && "$audio_state" != "closed" ]]; then
+            audio_owner="$(awk -F ': *' '$1 == "owner_pid" { print $2; exit }' \
+                "$alsa_pcm_status")"
+            runtime_errors+=(
+                "HDMI PCM is already in use (state: $audio_state, owner PID: ${audio_owner:-unknown})"
+            )
+        fi
+    fi
+
+    ((${#runtime_errors[@]} == 0))
+}
+
+print_runtime_errors() {
+    local drm_group message
+    printf '\nUxPlay Home cannot start: incomplete GStreamer runtime.\n' >&2
+    for message in "${runtime_errors[@]}"; do
+        printf '  - %s\n' "$message" >&2
+    done
+    if [[ -n "$drm_device" && -e "$drm_device" ]] && \
+       [[ ! -r "$drm_device" || ! -w "$drm_device" ]]; then
+        drm_group="$(stat -c '%G' "$drm_device" 2>/dev/null || echo render)"
+        printf 'Grant DRM access, then open a new login session:\n' >&2
+        printf '  sudo usermod -aG %q %q\n' "$drm_group" "$(id -un)" >&2
+    fi
+    if [[ -x "$script_dir/install.sh" ]]; then
+        printf 'Install the packaged dependencies with:\n  %s/install.sh\n' \
+            "$script_dir" >&2
+    else
+        printf '%s\n' \
+            'Install the missing packages from the extracted UxPlay package with ./install.sh.' \
+            >&2
+    fi
+    printf '\n' >&2
+}
+
+refresh_hardware() {
+    local candidate drm_card mode mode_width mode_height mode_pixels
+    local mode_short_side
+
+    connector=""
+    drm_device=""
+    display_name="disconnected"
+    display_max_width=0
+    display_max_height=0
+    display_max_pixels=0
+    display_max_short_side=0
+    eld_file=""
+    monitor_name="unavailable"
+    alsa_device="${UXPLAY_ALSA_DEVICE:-}"
+    alsa_pcm_status=""
+
+    for candidate in \
+        "$drm_root"/card*-HDMI-A-* \
+        "$drm_root"/card*-DP-*; do
+        [[ -r "$candidate/status" ]] || continue
+        if [[ "$(<"$candidate/status")" == "connected" ]]; then
+            connector="$candidate"
+            drm_card="$(basename "$candidate")"
+            drm_card="${drm_card%%-*}"
+            drm_device="$dri_root/$drm_card"
+            display_name="$(basename "$candidate")"
+            display_name="${display_name#card*-}"
+            break
+        fi
+    done
+
+    if [[ -n "$connector" && -r "$connector/modes" ]]; then
+        while IFS= read -r mode; do
+            if [[ "$mode" =~ ^([0-9]+)x([0-9]+)$ ]]; then
+                mode_width="${BASH_REMATCH[1]}"
+                mode_height="${BASH_REMATCH[2]}"
+                mode_pixels=$((mode_width * mode_height))
+                mode_short_side="$(min_int "$mode_width" "$mode_height")"
+                if ((mode_pixels > display_max_pixels)); then
+                    display_max_width="$mode_width"
+                    display_max_height="$mode_height"
+                    display_max_pixels="$mode_pixels"
+                fi
+                if ((mode_short_side > display_max_short_side)); then
+                    display_max_short_side="$mode_short_side"
+                fi
+            fi
+        done <"$connector/modes"
+    fi
+
+    for candidate in "$asound_root"/card*/eld*; do
+        if eld_is_valid "$candidate"; then
+            eld_file="$candidate"
+            monitor_name="$(awk '
+                $1 == "monitor_name" {
+                    sub(/^[^[:space:]]+[[:space:]]+/, "")
+                    print
+                    exit
+                }
+            ' "$candidate")"
+            if [[ -z "$alsa_device" ]]; then
+                alsa_device="$(alsa_device_from_eld "$candidate")"
+                alsa_pcm_status="$(alsa_status_from_eld "$candidate")"
+            fi
+            break
+        fi
+    done
+
+    select_decoder
+}
+
+hardware_ready() {
+    [[ -n "$connector" && "$display_max_short_side" -gt 0 ]] || return 1
+    [[ -n "$decoder" ]] || return 1
+    if [[ "$require_hdmi_audio" == "1" ]]; then
+        [[ -n "$alsa_device" && ( -n "$eld_file" || -n "${UXPLAY_ALSA_DEVICE:-}" ) ]]
+    fi
+}
+
+print_capabilities() {
+    printf '  Architecture: %s\n' "$(uname -m)"
+    printf '  DRM display:  %s\n' "$display_name"
+    if [[ -n "$drm_device" && -r "$drm_device" && -w "$drm_device" ]]; then
+        printf '  DRM device:   %s (read-write)\n' "$drm_device"
+    elif [[ -n "$drm_device" ]]; then
+        printf '  DRM device:   %s (no access)\n' "$drm_device"
+    else
+        printf '  DRM device:   unavailable\n'
+    fi
+    if ((display_max_pixels > 0)); then
+        printf '  EDID max:     %dx%d\n' "$display_max_width" "$display_max_height"
+    else
+        printf '  EDID max:     unavailable\n'
+    fi
+    printf '  HDMI audio:  %s\n' "$monitor_name"
+    printf '  ALSA output: %s\n' "${alsa_device:-unavailable}"
+    if [[ -r "$alsa_pcm_status" ]]; then
+        printf '  ALSA PCM:    %s\n' \
+            "$(awk -F ': *' '$1 == "state" { print $2; exit }' "$alsa_pcm_status")"
+    fi
+    printf '  H.264:       %s\n' "$decoder_description"
+    printf '  Video sink:  %s\n' "$video_sink"
+}
+
+wait_until_ready() {
+    local previous_state=""
+    local state
+
+    while true; do
+        refresh_hardware
+        if hardware_ready; then
+            return 0
+        fi
+
+        state="display=$display_name audio=${alsa_device:-unavailable} decoder=${decoder:-unavailable}"
+        if [[ "$state" != "$previous_state" ]]; then
+            printf 'Waiting for HDMI/DP hot-plug (%s)\n' "$state"
+            previous_state="$state"
+        fi
+        if [[ "$wait_for_display" != true ]]; then
+            return 1
+        fi
+        sleep "$poll_seconds"
+    done
+}
+
+stop_child() {
+    if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
+        kill -TERM "$child_pid" 2>/dev/null || true
+        wait "$child_pid" 2>/dev/null || true
+    fi
+}
+trap 'stop_child; exit 130' INT TERM HUP
+
+refresh_hardware
+runtime_ok=true
+if ! validate_runtime; then
+    runtime_ok=false
+fi
+if [[ "$diagnose_only" == true ]]; then
+    printf '\nUxPlay Home — HDMI hot-plug diagnostics\n'
+    print_capabilities
+    if [[ "$runtime_ok" != true ]]; then
+        printf '  Status:       runtime dependencies missing\n\n'
+        print_runtime_errors
+        exit 1
+    elif hardware_ready; then
+        printf '  Status:       ready\n\n'
+    else
+        printf '  Status:       waiting for display/audio\n\n'
+    fi
+    exit 0
+fi
+
+if [[ "$runtime_ok" != true ]]; then
+    print_runtime_errors
+    exit 1
+fi
+
+while true; do
+    if ! wait_until_ready; then
+        printf 'UxPlay Home cannot start: display/audio is not ready.\n\n' >&2
+        print_capabilities >&2
+        exit 1
+    fi
+
+    hls_max="$(highest_video_level "$display_max_short_side")"
+    if ((hls_max == 0)); then
+        echo "The connected display has no supported video mode." >&2
+        exit 1
+    fi
+    mirror_width="$(video_width_for_height "$hls_max")"
+    hls_profile="AVC:${hls_max},${hls_max};HEVC:0;VP9:0;AV1:0"
+
+    uxplay_args=(
+        -n "Home UxPlay" -nh
+        -hls -hls-single
+        -custom "$hls_profile"
+        -s "${mirror_width}x${hls_max}"
+        "${decoder_args[@]}"
+        -vsync no -low-latency -fps 60
+        -vs "$video_sink"
+    )
+    if [[ -n "$alsa_device" ]]; then
+        uxplay_args+=(-as "alsasink device=$alsa_device")
+    fi
+    if [[ "$debug" == true ]]; then
+        uxplay_args=(-d 1 "${uxplay_args[@]}")
+        log_level="debug (-d 1)"
+    else
+        log_level="info"
+    fi
+
+    {
+        printf '\nUxPlay home receiver start: %s\n' "$(date --iso-8601=seconds)"
+        printf 'Display: %s, %dx%d\n' \
+            "$display_name" "$display_max_width" "$display_max_height"
+        printf 'Audio: %s (%s)\n' "$monitor_name" "$alsa_device"
+        printf 'Decoder: %s\n' "$decoder_description"
+        printf 'Log level: %s\n\n' "$log_level"
+    } >>"$log_file"
+
+    printf '\nUxPlay Home — AirPlay receiver\n'
+    print_capabilities
+    printf '  HLS profile: %s\n' "$hls_profile"
+    printf '  Log level:   %s\n' "$log_level"
+    printf '  Log file:    %s (append mode)\n' "$log_file"
+    printf '  Status:      waiting for AirPlay connections\n\n'
+
+    "$uxplay_bin" "${uxplay_args[@]}" "${forward_args[@]}" \
+        >>"$log_file" 2>&1 &
+    child_pid=$!
+    hotplug_restart=false
+
+    while kill -0 "$child_pid" 2>/dev/null; do
+        sleep "$poll_seconds"
+        if [[ ! -r "$connector/status" || "$(<"$connector/status")" != "connected" ]]; then
+            printf 'Display disconnected; stopping UxPlay and waiting for hot-plug.\n'
+            printf 'Display disconnected: %s\n' "$(date --iso-8601=seconds)" \
+                >>"$log_file"
+            kill -TERM "$child_pid" 2>/dev/null || true
+            hotplug_restart=true
+            break
+        fi
+        if [[ "$require_hdmi_audio" == "1" && -n "$eld_file" ]] && \
+           ! eld_is_valid "$eld_file"; then
+            printf 'HDMI audio disappeared; stopping UxPlay and waiting for hot-plug.\n'
+            printf 'HDMI audio disappeared: %s\n' "$(date --iso-8601=seconds)" \
+                >>"$log_file"
+            kill -TERM "$child_pid" 2>/dev/null || true
+            hotplug_restart=true
+            break
+        fi
+    done
+
+    set +e
+    wait "$child_pid"
+    uxplay_status=$?
+    set -e
+    child_pid=""
+
+    if [[ "$hotplug_restart" == true ]]; then
+        continue
+    fi
+
+    case "$uxplay_status" in
+        0|130|143)
+            printf 'UxPlay stopped (status %d). Log: %s\n' \
+                "$uxplay_status" "$log_file"
+            ;;
+        *)
+            printf 'UxPlay exited with status %d. Check: %s\n' \
+                "$uxplay_status" "$log_file" >&2
+            ;;
+    esac
+    exit "$uxplay_status"
+done
