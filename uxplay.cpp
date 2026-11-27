@@ -2964,7 +2964,11 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
     audio_type = type;
     
     if (use_audio) {
-      audio_renderer_start(ct);
+        if (video_renderer_is_hls()) {
+            LOGI("HLS playbin owns the audio output; skipping duplicate AirPlay audio renderer");
+        } else {
+            audio_renderer_start(ct);
+        }
     }
 
     if (mux_to_file) {

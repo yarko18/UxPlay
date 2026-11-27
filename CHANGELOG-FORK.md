@@ -11,6 +11,8 @@
   a computer restart.
 - Fixed HDMI ELD-to-PCM selection and made direct HLS playback honor the
   configured UxPlay audio sink instead of silently falling back to PulseAudio.
+- Prevented direct HLS playback from opening a second, exclusive ALSA pipeline
+  when Safari also advertises the same soundtrack as an AirPlay ALAC stream.
 - Added `uxplay-home` for Raspberry Pi OS Lite/KMS with HDMI and decoder
   diagnostics, automatic quality selection, hardware H.264, HDMI audio, and
   bounded per-run logging.
