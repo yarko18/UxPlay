@@ -2623,7 +2623,8 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
             video_renderer_destroy();
             video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(), rtp_pipeline.c_str(),
                                 video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
-                                videosink_options.c_str(), fullscreen, video_sync, mirror_low_latency, h265_support,
+                                videosink_options.c_str(), audiosink.c_str(), fullscreen, video_sync,
+                                mirror_low_latency, h265_support,
                                 render_coverart, playbin_version, NULL);
             video_renderer_start();
             close_window = false;  // we already closed the window
@@ -3691,7 +3692,8 @@ int main (int argc, char *argv[]) {
     if (use_video) {
         video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(), rtp_pipeline.c_str(),
                             video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
-                            videosink_options.c_str(), fullscreen, video_sync, mirror_low_latency, h265_support,
+                            videosink_options.c_str(), audiosink.c_str(), fullscreen, video_sync,
+                            mirror_low_latency, h265_support,
                             render_coverart, playbin_version, NULL);
         video_renderer_start();
 #ifdef __OpenBSD__
@@ -3799,7 +3801,8 @@ int main (int argc, char *argv[]) {
             const char *uri = (url.empty() ? NULL : url.c_str());
             video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(),rtp_pipeline.c_str(),
                                 video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
-                                videosink_options.c_str(), fullscreen, video_sync, mirror_low_latency, h265_support,
+                                videosink_options.c_str(), audiosink.c_str(), fullscreen, video_sync,
+                                mirror_low_latency, h265_support,
                                 render_coverart, playbin_version, uri);
             full_video_reset = false;
             video_renderer_start();

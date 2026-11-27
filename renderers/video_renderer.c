@@ -237,6 +237,19 @@ GstElement *make_video_sink(const char *videosink, const char *videosink_options
     return video_sink;
 }
 
+static GstElement *make_audio_sink(const char *audiosink) {
+    GError *error = NULL;
+    GstElement *audio_sink = gst_parse_bin_from_description(audiosink, TRUE, &error);
+
+    if (error) {
+        logger_log(logger, LOGGER_ERR,
+                   "failed to create HLS audio sink from \"%s\": %s",
+                   audiosink, error->message);
+        g_clear_error(&error);
+    }
+    return audio_sink;
+}
+
 #ifdef NEED_G_STRING_REPLACE
 guint
 g_string_replace (GString     *string,
@@ -265,14 +278,16 @@ g_string_replace (GString     *string,
 #endif
 
 void video_renderer_init(logger_t *render_logger, const char *server_name, videoflip_t videoflip[2], const char *parser, const char * rtp_pipeline,
-                          const char *decoder, const char *converter, const char *videosink, const char *videosink_options, 
-                          bool initial_fullscreen, bool video_sync, bool low_latency, bool h265_support, bool coverart_support, guint playbin_version, const char *uri) {
+                          const char *decoder, const char *converter, const char *videosink, const char *videosink_options,
+                          const char *audiosink, bool initial_fullscreen, bool video_sync, bool low_latency,
+                          bool h265_support, bool coverart_support, guint playbin_version, const char *uri) {
     GError *error = NULL;
     GstCaps *caps = NULL;
     bool rtp = (bool) strlen(rtp_pipeline);
     hls_video = (uri != NULL);
     /* videosink choices that are auto */
     bool auto_videosink = (strstr(videosink, "autovideosink") || strstr(videosink, "fpsdisplaysink"));
+    bool auto_audiosink = (strstr(audiosink, "autoaudiosink") != NULL);
 
     logger = render_logger;
     logger_debug = (logger_get_level(logger) >= LOGGER_DEBUG);
@@ -349,6 +364,20 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
                 } else {
                     logger_log(logger, LOGGER_DEBUG, "video_renderer_init: create playbin_videosink at %p", playbin_videosink);
                     g_object_set(G_OBJECT (renderer_type[i]->pipeline), "video-sink", playbin_videosink, NULL);
+                }
+            }
+            if (!auto_audiosink && strcmp(audiosink, "0")) {
+                GstElement *playbin_audiosink = make_audio_sink(audiosink);
+                if (!playbin_audiosink) {
+                    logger_log(logger, LOGGER_ERR,
+                               "video_renderer_init: failed to create HLS audio sink");
+                } else {
+                    logger_log(logger, LOGGER_DEBUG,
+                               "video_renderer_init: HLS audio sink is \"%s\"",
+                               audiosink);
+                    g_object_set(G_OBJECT(renderer_type[i]->pipeline),
+                                 "audio-sink", playbin_audiosink, NULL);
+                    gst_object_unref(playbin_audiosink);
                 }
             }
             gint flags = 0;
