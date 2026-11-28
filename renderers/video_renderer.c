@@ -786,8 +786,13 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
             ret = gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
             logger_log(logger, LOGGER_DEBUG, "pipeline_state_change_return: %s",
                        gst_element_state_change_return_get_name(ret));
-            gst_element_get_state(renderer->pipeline, &state, NULL, 1000 * GST_MSECOND);
+            ret = gst_element_get_state(renderer->pipeline, &state, NULL, 5 * GST_SECOND);
             logger_log(logger, LOGGER_DEBUG, "pipeline state is %s", gst_element_state_get_name(state));
+            if (ret == GST_STATE_CHANGE_FAILURE || state != GST_STATE_NULL) {
+                logger_log(logger, LOGGER_ERR,
+                           "video renderer did not reach NULL; keeping it referenced to avoid unsafe teardown");
+                return;
+            }
         }
         if (renderer->appsrc) {
             gst_object_unref (renderer->appsrc);

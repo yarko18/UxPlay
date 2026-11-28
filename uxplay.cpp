@@ -109,7 +109,8 @@ static bool mirror_low_latency = false;
 static int64_t audio_delay_alac = 0;
 static int64_t audio_delay_aac = 0;
 static bool relaunch_video = false;
-static bool reset_loop = false;
+/* Written by AirPlay/RAOP worker threads and read by the GLib main loop. */
+static gint reset_loop = FALSE;
 static unsigned int open_connections= 0;
 static std::string videosink = "autovideosink";
 static std::string videosink_options = "";
@@ -686,7 +687,7 @@ static gboolean feedback_callback(gpointer loop) {
 }
 
 static gboolean reset_callback(gpointer loop) {
-    if (reset_loop) {
+    if (g_atomic_int_get(&reset_loop)) {
         g_main_loop_quit((GMainLoop *) loop);
     }
     return TRUE;
@@ -828,7 +829,7 @@ static void main_loop()  {
     GMainLoop *loop = g_main_loop_new(NULL,FALSE);
     relaunch_video = false;
     monitor_progress = false;
-    reset_loop = false;
+    g_atomic_int_set(&reset_loop, FALSE);
     reset_httpd = false;
     preserve_connections = false;
     n_video_renderers = 0;
@@ -2666,6 +2667,12 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
     case RESET_TYPE_RTP_TO_HLS_TEARDOWN:
         LOGD("video_reset: type = RTP_to_HLS_Shutdown");
         preserve_connections = true;
+        /* Do not change GStreamer state from this HTTP worker.  The main
+         * loop will remove its bus watches and destroy the RTP renderer
+         * before constructing the HLS renderer. */
+        remote_clock_offset = 0;
+        relaunch_video = true;
+        break;
     case RESET_TYPE_RTP_SHUTDOWN:
         LOGD("video_reset: type = RTP_Shutdown");      
         if (use_video) {
@@ -2676,9 +2683,7 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
         break;
     case RESET_TYPE_HLS_SHUTDOWN:
         LOGD("video_reset: type = HLS_Shutdown");
-        if (use_video) {
-            video_renderer_stop();
-        }
+        /* Renderer teardown is owned by the main loop. */
         if (hls_support) {
             url.erase();
             raop_destroy_airplay_video(raop, -1);
@@ -2695,7 +2700,7 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
         g_assert(FALSE);
         break;
     }
-    reset_loop = true;
+    g_atomic_int_set(&reset_loop, TRUE);
 }
 
 extern "C" int video_set_codec_and_size(void *cls, video_codec_t codec, unsigned short width_source,
@@ -2800,7 +2805,7 @@ extern "C" void conn_reset (void *cls, int reason) {
     }
     reset_httpd = true;
     relaunch_video = true;
-    reset_loop = true;
+    g_atomic_int_set(&reset_loop, TRUE);
 }
 
 extern "C" void report_client_request(void *cls, char *deviceid, char * model, char *name, bool *admit) {
