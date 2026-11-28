@@ -294,6 +294,11 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
             logger_log(raop->logger, LOGGER_DEBUG, "New connection %p identified as Connection type AirPlay", ptr);            
             httpd_set_connection_type(raop->httpd, ptr, CONNECTION_TYPE_AIRPLAY);
             conn->connection_type = CONNECTION_TYPE_AIRPLAY;
+            /* An AirPlay control connection is the first concrete indication
+             * that remote video playback is being negotiated.  GET
+             * /server-info alone is also used for capability probing and must
+             * not leave a mirror teardown waiting for HLS indefinitely. */
+            raop->hls_pending = true;
             conn->client_session_id = (char *) calloc(strlen(client_session_id) + 1, sizeof(char));
             assert(conn->client_session_id);
             memcpy(conn->client_session_id, client_session_id, strlen(client_session_id));
@@ -463,7 +468,6 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
             }
         } else if (!strcmp(method, "GET")) {
             if (!strcmp(url, "/server-info")) {
-                raop->hls_pending = true;
                 handler = &http_handler_server_info;
             } else if (!strcmp(url, "/playback-info")) {
                 handler = &http_handler_playback_info;

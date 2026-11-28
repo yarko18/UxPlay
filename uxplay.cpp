@@ -88,6 +88,7 @@
 #define LOWEST_ALLOWED_PORT 1024
 #define HIGHEST_PORT 65535
 #define MISSED_FEEDBACK_LIMIT 15
+#define HLS_PREPARE_TIMEOUT_SECONDS 20
 #define MIN_PASSWORD_LENGTH 4
 #define DEFAULT_PLAYBIN_VERSION 3
 #define BT709_FIX "capssetter caps=\"video/x-h264, colorimetry=bt709\""
@@ -193,6 +194,8 @@ static bool hls_support = false;
 static bool hls_single_variant = false;
 static std::atomic_bool remote_video_session{false};
 static std::atomic_bool hls_to_rtp_requested{false};
+static std::atomic_bool hls_prepare_pending{false};
+static std::atomic<int64_t> hls_prepare_deadline_us{0};
 static std::string lang_requested = "";
 static std::string lang_subtitles = "";
 static std::string lang_system = "";
@@ -721,6 +724,18 @@ static gboolean feedback_callback(gpointer loop) {
 }
 
 static gboolean reset_callback(gpointer loop) {
+    if (hls_prepare_pending.load() &&
+        g_get_monotonic_time() >= hls_prepare_deadline_us.load() &&
+        hls_prepare_pending.exchange(false)) {
+        LOGE("HLS preparation timed out after %d seconds; returning to the RTP idle renderer",
+             HLS_PREPARE_TIMEOUT_SECONDS);
+        remote_video_session = false;
+        hls_to_rtp_requested = true;
+        set_pending_rtp_request(true);
+        relaunch_video = true;
+        g_main_loop_quit((GMainLoop *) loop);
+        return TRUE;
+    }
     /* Consume only the reset that belongs to this loop.  A later request that
      * arrives during renderer teardown remains set for the next loop. */
     if (g_atomic_int_compare_and_exchange(&reset_loop, TRUE, FALSE)) {
@@ -2686,6 +2701,7 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
         }
     case RESET_TYPE_HLS_EOS:
         LOGD("video_reset: type= HLS_eos");
+        hls_prepare_pending = false;
         remote_video_session = false;
         hls_to_rtp_requested = true;
         if (use_video) {
@@ -2711,9 +2727,14 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
          * resetting here would only construct another RTP renderer because
          * the local HLS URL does not exist yet. */
         remote_clock_offset = 0;
+        hls_prepare_deadline_us = g_get_monotonic_time() +
+                                  ((int64_t) HLS_PREPARE_TIMEOUT_SECONDS * G_USEC_PER_SEC);
+        hls_prepare_pending = true;
+        LOGD("HLS preparation deadline armed for %d seconds", HLS_PREPARE_TIMEOUT_SECONDS);
         return;
     case RESET_TYPE_HLS_TO_RTP:
         LOGD("video_reset: type = HLS_to_RTP");
+        hls_prepare_pending = false;
         remote_video_session = false;
         hls_to_rtp_requested = true;
         /* Also cancels an HLS /play request that has not reached the renderer
@@ -2727,6 +2748,7 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
         break;
     case RESET_TYPE_RTP_SHUTDOWN:
         LOGD("video_reset: type = RTP_Shutdown");      
+        hls_prepare_pending = false;
         set_pending_rtp_request(false);
         if (use_video) {
             video_renderer_stop();
@@ -2736,6 +2758,7 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
         break;
     case RESET_TYPE_HLS_SHUTDOWN:
         LOGD("video_reset: type = HLS_Shutdown");
+        hls_prepare_pending = false;
         remote_video_session = false;
         hls_to_rtp_requested = true;
         /* Renderer teardown is owned by the main loop. */
@@ -2778,6 +2801,9 @@ extern "C" int video_set_codec_and_size(void *cls, video_codec_t codec, unsigned
     if (!use_video) {
         return 0;
     }
+    /* A fresh mirror codec packet is a successful rollback/resume signal if
+     * the client abandons remote-video negotiation before POST /play. */
+    hls_prepare_pending = false;
     if (!video_renderer_wait_for_rtp(0)) {
         LOGI("Mirror stream is waiting for the HLS-to-RTP renderer transition");
         /* /stop normally requests this transition first.  The codec packet is
@@ -2867,6 +2893,7 @@ extern "C" void conn_feedback (void *cls) {
 }
 
 extern "C" void conn_reset (void *cls, int reason) {
+    hls_prepare_pending = false;
     switch (reason) {
     case 1:
         LOGI("*** ERROR lost connection with client (network problem?)");
@@ -3221,6 +3248,7 @@ extern "C" bool get_hls_single_variant(void *cls) {
 extern "C" void on_video_play(void *cls, const char* location, const float start_position) {
     /* start_position needs to be implemented */
     video_renderer_set_start(start_position);
+    hls_prepare_pending = false;
     hls_to_rtp_requested = false;
     remote_video_session = true;
     set_pending_hls_request(location);
