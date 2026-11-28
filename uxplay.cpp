@@ -192,6 +192,7 @@ static int n_audio_renderers = 0;
 static bool hls_support = false;
 static bool hls_single_variant = false;
 static std::atomic_bool remote_video_session{false};
+static std::atomic_bool hls_to_rtp_requested{false};
 static std::string lang_requested = "";
 static std::string lang_subtitles = "";
 static std::string lang_system = "";
@@ -892,6 +893,7 @@ static void main_loop()  {
         /* RTP workers may select a codec (and destroy unused pipelines) only
          * after every pipeline has a bus watch on the main context. */
         if (!video_renderer_is_hls()) {
+            hls_to_rtp_requested = false;
             video_renderer_notify_rtp_ready();
         }
     }
@@ -2685,6 +2687,7 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
     case RESET_TYPE_HLS_EOS:
         LOGD("video_reset: type= HLS_eos");
         remote_video_session = false;
+        hls_to_rtp_requested = true;
         if (use_video) {
             video_renderer_stop();
            /* reset the video renderer immediately to avoid a timing issue if we wait for main_loop to reset */ 
@@ -2712,6 +2715,7 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
     case RESET_TYPE_HLS_TO_RTP:
         LOGD("video_reset: type = HLS_to_RTP");
         remote_video_session = false;
+        hls_to_rtp_requested = true;
         /* Also cancels an HLS /play request that has not reached the renderer
          * yet.  In that case reset_loop is already set by on_video_play(). */
         set_pending_rtp_request(true);
@@ -2733,6 +2737,7 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
     case RESET_TYPE_HLS_SHUTDOWN:
         LOGD("video_reset: type = HLS_Shutdown");
         remote_video_session = false;
+        hls_to_rtp_requested = true;
         /* Renderer teardown is owned by the main loop. */
         set_pending_rtp_request(true);
         if (hls_support) {
@@ -2752,6 +2757,17 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
     g_atomic_int_set(&reset_loop, TRUE);
 }
 
+static bool request_hls_to_rtp(void *cls, const char *source) {
+    bool expected = false;
+    if (!hls_to_rtp_requested.compare_exchange_strong(expected, true)) {
+        LOGD("HLS_to_RTP request from %s coalesced with transition already in progress", source);
+        return false;
+    }
+    LOGD("HLS_to_RTP transition requested by %s", source);
+    video_reset(cls, RESET_TYPE_HLS_TO_RTP);
+    return true;
+}
+
 extern "C" int video_set_codec_and_size(void *cls, video_codec_t codec, unsigned short width_source,
                                         unsigned short height_source, unsigned short x_offset,
                                         unsigned short y_offset, unsigned short width, unsigned short height) {
@@ -2768,7 +2784,7 @@ extern "C" int video_set_codec_and_size(void *cls, video_codec_t codec, unsigned
          * also a fallback trigger if /stop was omitted, but must not enqueue a
          * second reset once RTP initialization has already begun. */
         if (video_renderer_is_hls()) {
-            video_reset(cls, RESET_TYPE_HLS_TO_RTP);
+            request_hls_to_rtp(cls, "mirror codec packet");
         }
         if (!video_renderer_wait_for_rtp(10000)) {
             LOGE("RTP video renderer was not ready after 10 seconds; rejecting mirror stream");
@@ -3205,6 +3221,7 @@ extern "C" bool get_hls_single_variant(void *cls) {
 extern "C" void on_video_play(void *cls, const char* location, const float start_position) {
     /* start_position needs to be implemented */
     video_renderer_set_start(start_position);
+    hls_to_rtp_requested = false;
     remote_video_session = true;
     set_pending_hls_request(location);
     relaunch_video = true;
@@ -3246,7 +3263,7 @@ extern "C" float on_video_playlist_remove (void *cls) {
         LOGD("on_video_stop: no remote video session is active");
         return;
     }
-    video_reset(cls, RESET_TYPE_HLS_TO_RTP);
+    request_hls_to_rtp(cls, "POST /stop");
  }
 
 extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *playback_info) {
