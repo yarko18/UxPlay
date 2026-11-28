@@ -2666,13 +2666,12 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
         break;
     case RESET_TYPE_RTP_TO_HLS_TEARDOWN:
         LOGD("video_reset: type = RTP_to_HLS_Shutdown");
-        preserve_connections = true;
-        /* Do not change GStreamer state from this HTTP worker.  The main
-         * loop will remove its bus watches and destroy the RTP renderer
-         * before constructing the HLS renderer. */
+        /* The mirror producer has already been stopped and joined.  Keep
+         * the last RTP frame until playlist resolution calls on_video_play;
+         * resetting here would only construct another RTP renderer because
+         * the local HLS URL does not exist yet. */
         remote_clock_offset = 0;
-        relaunch_video = true;
-        break;
+        return;
     case RESET_TYPE_RTP_SHUTDOWN:
         LOGD("video_reset: type = RTP_Shutdown");      
         if (use_video) {
