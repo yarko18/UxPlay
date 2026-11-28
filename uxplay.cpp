@@ -2775,19 +2775,10 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
         hls_prepare_pending = false;
         remote_video_session = false;
         hls_to_rtp_requested = true;
-        if (use_video) {
-            video_renderer_stop();
-           /* reset the video renderer immediately to avoid a timing issue if we wait for main_loop to reset */ 
-            video_renderer_destroy();
-            video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(), rtp_pipeline.c_str(),
-                                video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
-                                videosink_options.c_str(), audiosink.c_str(), fullscreen, video_sync,
-                                mirror_low_latency, h265_support,
-                                render_coverart, playbin_version, NULL);
-            video_renderer_start();
-            close_window = false;  // we already closed the window
-        }
-        set_pending_rtp_request(false); //we already closed all other connections
+        /* HLS EOS is delivered on the GLib main thread.  Let the outer
+         * lifecycle remove bus watches and replace the renderer instead of
+         * destroying a pipeline from inside one of its callbacks. */
+        set_pending_rtp_request(true);
         remote_clock_offset = 0;
         relaunch_video = true;
         break;
@@ -4029,17 +4020,21 @@ int main (int argc, char *argv[]) {
     }
     const video_request_t video_request = take_pending_video_request();
     if (relaunch_video.load()) {
-        if (reset_httpd) {
+        const bool replace_video_renderer =
+            use_video && (close_window || video_request.preserve_connections || full_video_reset);
+        /* A non-preserving replacement must synchronously stop the HTTP/RAOP
+         * server.  Joining it also joins every RTP mirror producer before its
+         * GStreamer consumer is destroyed. */
+        const bool restart_httpd = reset_httpd ||
+                                   (replace_video_renderer && !video_request.preserve_connections);
+        if (restart_httpd) {
             raop_stop_httpd(raop);
         }
         if (use_audio) {
             audio_session_stop_renderer();
         }
-        if (use_video && (close_window || video_request.preserve_connections || full_video_reset)) {
+        if (replace_video_renderer) {
             video_renderer_destroy();
-            if (!video_request.preserve_connections) {
-                raop_remove_known_connections(raop);
-            }
             const char *uri = (video_request.url.empty() ? NULL : video_request.url.c_str());
             video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(),rtp_pipeline.c_str(),
                                 video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
@@ -4049,7 +4044,7 @@ int main (int argc, char *argv[]) {
             full_video_reset = false;
             video_renderer_start();
         }
-        if (reset_httpd) {
+        if (restart_httpd) {
             unsigned short port = raop_get_port(raop);
             raop_start_httpd(raop, &port);
             raop_set_port(raop, port);
