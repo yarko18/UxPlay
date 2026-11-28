@@ -72,6 +72,7 @@ void video_renderer_resume ();
 int video_renderer_cycle ();
 bool video_renderer_is_paused();
 bool video_renderer_is_hls(void);
+bool video_renderer_take_hls_error(void);
 void video_renderer_notify_rtp_ready(void);
 bool video_renderer_wait_for_rtp(unsigned int timeout_ms);
 bool video_renderer_eos_watch();

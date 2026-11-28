@@ -204,6 +204,7 @@ static std::string lang_system = "";
 static GMutex video_request_mutex;
 static std::string pending_video_url = "";
 static bool pending_preserve_connections = false;
+static bool pending_video_request_valid = false;
 static guint gst_x11_window_id = 0;
 static guint video_eos_watch_id = 0;
 static guint progress_id = 0;
@@ -240,6 +241,7 @@ static void set_pending_hls_request(const char *location) {
     g_mutex_lock(&video_request_mutex);
     pending_video_url.assign(location ? location : "");
     pending_preserve_connections = true;
+    pending_video_request_valid = true;
     g_mutex_unlock(&video_request_mutex);
 }
 
@@ -247,7 +249,20 @@ static void set_pending_rtp_request(bool preserve_connections) {
     g_mutex_lock(&video_request_mutex);
     pending_video_url.clear();
     pending_preserve_connections = preserve_connections;
+    pending_video_request_valid = true;
     g_mutex_unlock(&video_request_mutex);
+}
+
+static bool set_pending_rtp_request_if_none(bool preserve_connections) {
+    g_mutex_lock(&video_request_mutex);
+    bool request_set = !pending_video_request_valid;
+    if (request_set) {
+        pending_video_url.clear();
+        pending_preserve_connections = preserve_connections;
+        pending_video_request_valid = true;
+    }
+    g_mutex_unlock(&video_request_mutex);
+    return request_set;
 }
 
 static video_request_t take_pending_video_request() {
@@ -255,6 +270,7 @@ static video_request_t take_pending_video_request() {
     video_request_t request = {pending_preserve_connections, ""};
     request.url.swap(pending_video_url);
     pending_preserve_connections = false;
+    pending_video_request_valid = false;
     g_mutex_unlock(&video_request_mutex);
     return request;
 }
@@ -3934,6 +3950,17 @@ int main (int argc, char *argv[]) {
     compression_type = 0;
     close_window = new_window_closing_behavior;
     main_loop();
+    if (video_renderer_take_hls_error()) {
+        if (set_pending_rtp_request_if_none(true)) {
+            LOGE("HLS renderer failed; returning to the RTP idle renderer");
+            hls_prepare_pending = false;
+            remote_video_session = false;
+            hls_to_rtp_requested = true;
+            relaunch_video = true;
+        } else {
+            LOGI("HLS renderer failed; a newer AirPlay video transition is already pending");
+        }
+    }
     const video_request_t video_request = take_pending_video_request();
     if (relaunch_video.load()) {
         if (reset_httpd) {

@@ -61,6 +61,7 @@ static logger_t *logger = NULL;
 static bool first_packet = false;
 static bool sync = false;
 static gint hls_video = FALSE;
+static gint hls_renderer_error = FALSE;
 
 /*
  * Renderer lifecycle is owned by the GLib main thread, while the first mirror
@@ -119,6 +120,10 @@ void video_renderer_notify_rtp_ready(void) {
         g_cond_broadcast(&renderer_state_cond);
     }
     g_mutex_unlock(&renderer_state_mutex);
+}
+
+bool video_renderer_take_hls_error(void) {
+    return g_atomic_int_compare_and_exchange(&hls_renderer_error, TRUE, FALSE);
 }
 #ifdef X_DISPLAY_FIX
 static bool use_x11 = false;
@@ -348,6 +353,7 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
     GstCaps *caps = NULL;
     bool rtp = (bool) strlen(rtp_pipeline);
     g_atomic_int_set(&hls_video, uri != NULL);
+    g_atomic_int_set(&hls_renderer_error, FALSE);
     video_renderer_set_state(uri ? VIDEO_RENDERER_INITIALIZING_HLS : VIDEO_RENDERER_INITIALIZING_RTP);
     /* videosink choices that are auto */
     bool auto_videosink = (strstr(videosink, "autovideosink") || strstr(videosink, "fpsdisplaysink"));
@@ -1064,11 +1070,15 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
         if (renderer->appsrc) {
             gst_app_src_end_of_stream (GST_APP_SRC(renderer->appsrc));
         }
-        if (!video_renderer_is_hls() || closed_window) {
-            gst_bus_set_flushing(bus, TRUE);
-            gst_element_set_state (renderer->pipeline, GST_STATE_READY);
-            g_main_loop_quit( (GMainLoop *) loop);
+        if (video_renderer_is_hls() && !closed_window) {
+            /* Report the terminal HLS failure to the owner of the renderer
+             * lifecycle.  It will replace playbin with the RTP renderer while
+             * preserving the AirPlay control connection. */
+            g_atomic_int_set(&hls_renderer_error, TRUE);
         }
+        gst_bus_set_flushing(bus, TRUE);
+        gst_element_set_state (renderer->pipeline, GST_STATE_READY);
+        g_main_loop_quit( (GMainLoop *) loop);
         break;
     }
     case GST_MESSAGE_EOS:
