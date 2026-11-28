@@ -121,6 +121,7 @@ struct raop_conn_s {
     char *client_session_id;
     bool authenticated;
     bool have_active_remote;
+    bool audio_stream_active;
 };
 typedef struct raop_conn_s raop_conn_t;
 
@@ -555,10 +556,6 @@ conn_destroy(void *ptr) {
     raop_t *raop = conn->raop;
     logger_log(raop->logger, LOGGER_DEBUG, "Destroying connection");
 
-    if (raop->callbacks.conn_destroy) {
-        raop->callbacks.conn_destroy(raop->callbacks.cls);
-    }
-
     if (conn->raop_rtp) {
         /* This is done in case TEARDOWN was not called */
         raop_rtp_destroy(conn->raop_rtp);
@@ -569,6 +566,15 @@ conn_destroy(void *ptr) {
     }
     if (conn->raop_ntp) {
         raop_ntp_destroy(conn->raop_ntp);
+    }
+
+    if (conn->audio_stream_active && raop->callbacks.audio_teardown) {
+        raop->callbacks.audio_teardown(raop->callbacks.cls);
+        conn->audio_stream_active = false;
+    }
+
+    if (raop->callbacks.conn_destroy) {
+        raop->callbacks.conn_destroy(raop->callbacks.cls);
     }
 
     if (raop->callbacks.video_flush) {

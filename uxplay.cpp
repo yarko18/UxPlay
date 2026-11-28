@@ -119,6 +119,10 @@ static std::string videosink_options = "";
 static videoflip_t videoflip[2] = { NONE , NONE };
 static bool use_video = true;
 static unsigned char compression_type = 0;
+static GMutex audio_session_mutex;
+static bool audio_session_active = false;
+static bool audio_session_deferred = false;
+static unsigned char audio_session_ct = 0;
 static std::string audiosink = "autoaudiosink";
 static int  audiodelay = -1;
 static bool use_audio = true;
@@ -273,6 +277,50 @@ static video_request_t take_pending_video_request() {
     pending_video_request_valid = false;
     g_mutex_unlock(&video_request_mutex);
     return request;
+}
+
+static bool audio_session_set_format(unsigned char ct) {
+    g_mutex_lock(&audio_session_mutex);
+    audio_session_active = true;
+    audio_session_ct = ct;
+    audio_session_deferred = video_renderer_is_hls();
+    if (!audio_session_deferred) {
+        audio_renderer_start(&audio_session_ct);
+    }
+    bool deferred = audio_session_deferred;
+    g_mutex_unlock(&audio_session_mutex);
+    return deferred;
+}
+
+static int audio_session_start_if_active() {
+    int deferred_ct = -1;
+    g_mutex_lock(&audio_session_mutex);
+    if (audio_session_active) {
+        if (audio_session_deferred) {
+            deferred_ct = audio_session_ct;
+        }
+        audio_renderer_start(&audio_session_ct);
+        audio_session_deferred = false;
+    }
+    g_mutex_unlock(&audio_session_mutex);
+    return deferred_ct;
+}
+
+static void audio_session_stop_renderer() {
+    g_mutex_lock(&audio_session_mutex);
+    if (audio_session_active) {
+        audio_session_deferred = true;
+    }
+    audio_renderer_stop();
+    g_mutex_unlock(&audio_session_mutex);
+}
+
+static void audio_session_end() {
+    g_mutex_lock(&audio_session_mutex);
+    audio_session_active = false;
+    audio_session_deferred = false;
+    audio_renderer_stop();
+    g_mutex_unlock(&audio_session_mutex);
 }
 
 //Support for D-Bus-based screensaver inhibition (org.freedesktop.ScreenSaver) 
@@ -921,12 +969,6 @@ static void main_loop()  {
         for (int i = 0; i < n_video_renderers; i++) {
             gst_video_bus_watch_id[i] = (guint) video_renderer_listen((void *)loop, i);
         }
-        /* RTP workers may select a codec (and destroy unused pipelines) only
-         * after every pipeline has a bus watch on the main context. */
-        if (!video_renderer_is_hls()) {
-            hls_to_rtp_requested = false;
-            video_renderer_notify_rtp_ready();
-        }
     }
     if (use_audio) {
         rtptime_start = 0;
@@ -939,6 +981,19 @@ static void main_loop()  {
         g_assert(n_audio_renderers <= MAX_AUDIO_RENDERERS);
         for (int i = 0; i < n_audio_renderers; i++) {
             gst_audio_bus_watch_id[i] = (guint) audio_renderer_listen((void *)loop, i);      
+        }
+    }
+
+    /* Producers may start only after every video and audio pipeline has its
+     * bus watch installed on this main context. */
+    if (use_video && !video_renderer_is_hls()) {
+        hls_to_rtp_requested = false;
+        video_renderer_notify_rtp_ready();
+        if (use_audio) {
+            int deferred_ct = audio_session_start_if_active();
+            if (deferred_ct >= 0) {
+                LOGI("RTP renderer is ready; started deferred AirPlay audio (ct=%d)", deferred_ct);
+            }
         }
     }
 
@@ -2892,7 +2947,7 @@ extern "C" void conn_destroy (void *cls) {
     if (open_connections == 0) {
         remote_clock_offset = 0;
         if (use_audio) {
-            audio_renderer_stop();
+            audio_session_end();
         }
         if (dacpfile.length()) {
             remove (dacpfile.c_str());
@@ -2981,7 +3036,9 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
         default:
             break;
         }
+        g_mutex_lock(&audio_session_mutex);
         audio_renderer_render_buffer(data->data, &(data->data_len), &(data->seqnum), &(data->ntp_time_remote));
+        g_mutex_unlock(&audio_session_mutex);
     }
 }
 
@@ -3035,7 +3092,9 @@ extern "C" void video_resume (void *cls) {
 
 extern "C" void audio_flush (void *cls) {
     if (use_audio) {
+        g_mutex_lock(&audio_session_mutex);
         audio_renderer_flush();
+        g_mutex_unlock(&audio_session_mutex);
     }
 }
 
@@ -3094,7 +3153,9 @@ extern "C" void audio_set_volume (void *cls, float volume) {
         /* conversion from (gain) decibels to GStreamer's linear volume scale */
         gst_volume = pow(10.0, 0.05*db);
     }
+    g_mutex_lock(&audio_session_mutex);
     audio_renderer_set_volume(gst_volume);
+    g_mutex_unlock(&audio_session_mutex);
     video_renderer_hls_set_volume(gst_volume);
     LOGI("AirPlay volume %.1f dB (slider %.0f%%): GStreamer volume %.3f", (double) volume, 100.0 * frac, gst_volume);
 }
@@ -3120,10 +3181,8 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
     audio_type = type;
     
     if (use_audio) {
-        if (video_renderer_is_hls()) {
+        if (audio_session_set_format(*ct)) {
             LOGI("HLS playbin owns the audio output; skipping duplicate AirPlay audio renderer");
-        } else {
-            audio_renderer_start(ct);
         }
     }
 
@@ -3154,6 +3213,12 @@ extern "C" void audio_set_coverart(void *cls, const void *buffer, int buflen) {
 extern "C" void audio_stop_coverart_rendering(void *cls) {
     if (render_coverart) {
         video_reset(cls, RESET_TYPE_RTP_SHUTDOWN);
+    }
+}
+
+extern "C" void audio_teardown(void *cls) {
+    if (use_audio) {
+        audio_session_end();
     }
 }
 
@@ -3370,6 +3435,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_cbs.audio_process = audio_process;
     raop_cbs.video_process = video_process;
     raop_cbs.audio_flush = audio_flush;
+    raop_cbs.audio_teardown = audio_teardown;
     raop_cbs.video_flush = video_flush;
     raop_cbs.video_pause = video_pause;
     raop_cbs.video_resume = video_resume;
@@ -3967,7 +4033,7 @@ int main (int argc, char *argv[]) {
             raop_stop_httpd(raop);
         }
         if (use_audio) {
-            audio_renderer_stop();
+            audio_session_stop_renderer();
         }
         if (use_video && (close_window || video_request.preserve_connections || full_video_reset)) {
             video_renderer_destroy();

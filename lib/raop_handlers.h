@@ -1072,6 +1072,7 @@ raop_handler_setup(raop_conn_t *conn,
 
                 if (conn->raop_rtp) {
                     raop_rtp_start_audio(conn->raop_rtp, &remote_cport, &cport, &dport, &ct, &sr);
+                    conn->audio_stream_active = true;
                     logger_log(raop->logger, LOGGER_DEBUG, "RAOP initialized success");
                 } else {
                     logger_log(raop->logger, LOGGER_ERR, "RAOP not initialized at SETUP, playing will fail!");
@@ -1329,10 +1330,14 @@ raop_handler_teardown(raop_conn_t *conn,
         if (conn->raop_rtp) {
             /* Stop our audio RTP session */
             raop_rtp_stop(conn->raop_rtp);
-            /* stop any  coverart rendering */
-            if (raop->callbacks.audio_stop_coverart_rendering) {
-                raop->callbacks.audio_stop_coverart_rendering(raop->callbacks.cls);
-            }
+        }
+        if (conn->audio_stream_active && raop->callbacks.audio_teardown) {
+            raop->callbacks.audio_teardown(raop->callbacks.cls);
+        }
+        conn->audio_stream_active = false;
+        /* stop any coverart rendering */
+        if (raop->callbacks.audio_stop_coverart_rendering) {
+            raop->callbacks.audio_stop_coverart_rendering(raop->callbacks.cls);
         }
     } else if (teardown_110) {
         if (conn->raop_rtp_mirror) {

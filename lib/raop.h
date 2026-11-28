@@ -97,6 +97,7 @@ struct raop_callbacks_s {
     void  (*conn_init)(void *cls);
     void  (*conn_destroy)(void *cls);
     void  (*audio_flush)(void *cls);
+    void  (*audio_teardown)(void *cls);
     void  (*video_flush)(void *cls);
     double (*audio_set_client_volume)(void *cls);
     void  (*audio_set_volume)(void *cls, float volume);
