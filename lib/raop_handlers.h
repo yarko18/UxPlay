@@ -1335,14 +1335,17 @@ raop_handler_teardown(raop_conn_t *conn,
             }
         }
     } else if (teardown_110) {
+        if (conn->raop_rtp_mirror) {
+            /* Stop and join the producer before asking the main loop to
+             * destroy its GStreamer consumer.  Otherwise the reset timer
+             * can win this race while video_process() is still pushing an
+             * appsrc buffer. */
+            raop_rtp_mirror_stop(conn->raop_rtp_mirror);
+        }
         if (raop->hls_pending) {
             raop->callbacks.video_reset(raop->callbacks.cls, RESET_TYPE_RTP_TO_HLS_TEARDOWN);
         } else {
             raop->callbacks.video_reset(raop->callbacks.cls, RESET_TYPE_RTP_SHUTDOWN);
-        }
-        if (conn->raop_rtp_mirror) {
-        /* Stop our video RTP session */
-            raop_rtp_mirror_stop(conn->raop_rtp_mirror);
         }
     } else {
         /* Destroy our sessions */
