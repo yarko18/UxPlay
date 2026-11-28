@@ -243,6 +243,7 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
 }
 
 void audio_renderer_stop() {
+    render_audio = FALSE;
     if (renderer) {
         gst_app_src_end_of_stream(GST_APP_SRC(renderer->appsrc));
         gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
@@ -311,7 +312,9 @@ void  audio_renderer_start(unsigned char *ct) {
 void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned short *seqnum, uint64_t *ntp_time) {
     GstBuffer *buffer = NULL;
 
-    if (!render_audio) return;    /* do nothing unless render_audio == TRUE */
+    if (!render_audio || !renderer || !data_len || *data_len <= 0) {
+        return;
+    }
 
     GstClockTime pts = (GstClockTime) *ntp_time ;    /* now in nsecs */
     //GstClockTimeDiff latency = GST_CLOCK_DIFF(gst_element_get_current_clock_time (renderer->appsrc), pts);
@@ -324,8 +327,6 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
             return;
         }
     }
-    if (data_len == 0 || renderer == NULL) return;
-
     /* all audio received seems to be either ct = 8 (AAC_ELD 44100/2 spf 460 ) AirPlay Mirror protocol *
      * or ct = 2 (ALAC 44100/16/2 spf 352) AirPlay protocol.                                           *
      * first byte data[0] of ALAC frame is 0x20,                                                       *
@@ -408,6 +409,17 @@ void audio_renderer_destroy() {
 }
 
 static gboolean gstreamer_audio_pipeline_bus_callback(GstBus *bus, GstMessage *message, void *loop) {
+    audio_renderer_t *bus_renderer = NULL;
+    for (int i = 0; i < NFORMATS; i++) {
+        if (renderer_type[i] && renderer_type[i]->bus == bus) {
+            bus_renderer = renderer_type[i];
+            break;
+        }
+    }
+    if (!bus_renderer) {
+        return TRUE;
+    }
+
     switch (GST_MESSAGE_TYPE(message)) {
     case GST_MESSAGE_ERROR: {
         GError *err = NULL;
@@ -416,12 +428,15 @@ static gboolean gstreamer_audio_pipeline_bus_callback(GstBus *bus, GstMessage *m
         logger_log(logger, LOGGER_INFO, "GStreamer error (audio): %s %s", GST_MESSAGE_SRC_NAME(message),err->message);
         g_error_free(err);
         g_free(debug);
-        if (renderer->appsrc) {
-            gst_app_src_end_of_stream (GST_APP_SRC(renderer->appsrc));
+        if (bus_renderer->appsrc) {
+            gst_app_src_end_of_stream (GST_APP_SRC(bus_renderer->appsrc));
         }
         gst_bus_set_flushing(bus, TRUE);
-        gst_element_set_state (renderer->pipeline, GST_STATE_READY);
-        g_main_loop_quit( (GMainLoop *) loop);
+        gst_element_set_state (bus_renderer->pipeline, GST_STATE_READY);
+        if (bus_renderer == renderer) {
+            render_audio = FALSE;
+            g_main_loop_quit( (GMainLoop *) loop);
+        }
 	break;
     }
     case GST_MESSAGE_EOS:
