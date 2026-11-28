@@ -33,6 +33,7 @@
 #include <iostream>
 #include <memory>
 #include <iterator>
+#include <atomic>
 #include <sys/stat.h>
 #include <cstdio>
 #include <stdarg.h>
@@ -108,7 +109,7 @@ static bool video_sync = true;
 static bool mirror_low_latency = false;
 static int64_t audio_delay_alac = 0;
 static int64_t audio_delay_aac = 0;
-static bool relaunch_video = false;
+static std::atomic_bool relaunch_video{false};
 /* Written by AirPlay/RAOP worker threads and read by the GLib main loop. */
 static gint reset_loop = FALSE;
 static unsigned int open_connections= 0;
@@ -190,15 +191,19 @@ static int n_video_renderers = 0;
 static int n_audio_renderers = 0;
 static bool hls_support = false;
 static bool hls_single_variant = false;
+static std::atomic_bool remote_video_session{false};
 static std::string lang_requested = "";
 static std::string lang_subtitles = "";
 static std::string lang_system = "";
-static std::string url = "";
+/* A URL is a pending request, not the current renderer mode.  AirPlay worker
+ * threads may replace it while the main thread is rebuilding a renderer. */
+static GMutex video_request_mutex;
+static std::string pending_video_url = "";
+static bool pending_preserve_connections = false;
 static guint gst_x11_window_id = 0;
 static guint video_eos_watch_id = 0;
 static guint progress_id = 0;
 static guint gst_hls_position_id = 0;
-static bool preserve_connections = false;
 static guint missed_feedback_limit = MISSED_FEEDBACK_LIMIT;
 static guint missed_feedback = 0;
 static guint playbin_version = DEFAULT_PLAYBIN_VERSION;
@@ -221,6 +226,34 @@ static bool mux_to_file = false;
 static std::string mux_filename = "recording";
 static bool raspberry_pi_hls_support = false;
 static std::string custom_profile_string = "";
+
+typedef struct video_request_s {
+    bool preserve_connections;
+    std::string url;
+} video_request_t;
+
+static void set_pending_hls_request(const char *location) {
+    g_mutex_lock(&video_request_mutex);
+    pending_video_url.assign(location ? location : "");
+    pending_preserve_connections = true;
+    g_mutex_unlock(&video_request_mutex);
+}
+
+static void set_pending_rtp_request(bool preserve_connections) {
+    g_mutex_lock(&video_request_mutex);
+    pending_video_url.clear();
+    pending_preserve_connections = preserve_connections;
+    g_mutex_unlock(&video_request_mutex);
+}
+
+static video_request_t take_pending_video_request() {
+    g_mutex_lock(&video_request_mutex);
+    video_request_t request = {pending_preserve_connections, ""};
+    request.url.swap(pending_video_url);
+    pending_preserve_connections = false;
+    g_mutex_unlock(&video_request_mutex);
+    return request;
+}
 
 //Support for D-Bus-based screensaver inhibition (org.freedesktop.ScreenSaver) 
 static unsigned int scrsv = 0;
@@ -687,7 +720,9 @@ static gboolean feedback_callback(gpointer loop) {
 }
 
 static gboolean reset_callback(gpointer loop) {
-    if (g_atomic_int_get(&reset_loop)) {
+    /* Consume only the reset that belongs to this loop.  A later request that
+     * arrives during renderer teardown remains set for the next loop. */
+    if (g_atomic_int_compare_and_exchange(&reset_loop, TRUE, FALSE)) {
         g_main_loop_quit((GMainLoop *) loop);
     }
     return TRUE;
@@ -829,15 +864,13 @@ static void main_loop()  {
     GMainLoop *loop = g_main_loop_new(NULL,FALSE);
     relaunch_video = false;
     monitor_progress = false;
-    g_atomic_int_set(&reset_loop, FALSE);
     reset_httpd = false;
-    preserve_connections = false;
     n_video_renderers = 0;
     n_audio_renderers = 0;
     if (use_video) {
         n_video_renderers = 1;
         relaunch_video = true;
-        if (url.empty()) {
+        if (!video_renderer_is_hls()) {
             if (h265_support) {
                 n_video_renderers++;
             }
@@ -849,13 +882,17 @@ static void main_loop()  {
 	    video_eos_watch_id = 0;
         } else {
             /* hls video will be rendered: renderer[0] : hls  */
-            url.erase();
             video_eos_watch_id = g_timeout_add(100, (GSourceFunc) video_eos_watch_callback, (gpointer) loop);
             gst_x11_window_id = g_timeout_add(100, (GSourceFunc) x11_window_callback, (gpointer) loop);
         }
         g_assert(n_video_renderers <= MAX_VIDEO_RENDERERS);
         for (int i = 0; i < n_video_renderers; i++) {
             gst_video_bus_watch_id[i] = (guint) video_renderer_listen((void *)loop, i);
+        }
+        /* RTP workers may select a codec (and destroy unused pipelines) only
+         * after every pipeline has a bus watch on the main context. */
+        if (!video_renderer_is_hls()) {
+            video_renderer_notify_rtp_ready();
         }
     }
     if (use_audio) {
@@ -2643,11 +2680,11 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
     case RESET_TYPE_NOHOLD:
         LOGD("video_reset: type = NoHold");
         if (hls_support) {
-	    url.erase();
             raop_destroy_airplay_video(raop, -1);
         }
     case RESET_TYPE_HLS_EOS:
         LOGD("video_reset: type= HLS_eos");
+        remote_video_session = false;
         if (use_video) {
             video_renderer_stop();
            /* reset the video renderer immediately to avoid a timing issue if we wait for main_loop to reset */ 
@@ -2660,7 +2697,7 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
             video_renderer_start();
             close_window = false;  // we already closed the window
         }
-        preserve_connections = false; //we already closed all other connections
+        set_pending_rtp_request(false); //we already closed all other connections
         remote_clock_offset = 0;
         relaunch_video = true;
         break;
@@ -2672,8 +2709,21 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
          * the local HLS URL does not exist yet. */
         remote_clock_offset = 0;
         return;
+    case RESET_TYPE_HLS_TO_RTP:
+        LOGD("video_reset: type = HLS_to_RTP");
+        remote_video_session = false;
+        /* Also cancels an HLS /play request that has not reached the renderer
+         * yet.  In that case reset_loop is already set by on_video_play(). */
+        set_pending_rtp_request(true);
+        /* Keep the AirPlay/HLS control connections.  Only the main loop may
+         * replace the renderer; the mirror worker waits for RTP readiness in
+         * video_set_codec_and_size(). */
+        remote_clock_offset = 0;
+        relaunch_video = true;
+        break;
     case RESET_TYPE_RTP_SHUTDOWN:
         LOGD("video_reset: type = RTP_Shutdown");      
+        set_pending_rtp_request(false);
         if (use_video) {
             video_renderer_stop();
         }
@@ -2682,13 +2732,13 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
         break;
     case RESET_TYPE_HLS_SHUTDOWN:
         LOGD("video_reset: type = HLS_Shutdown");
+        remote_video_session = false;
         /* Renderer teardown is owned by the main loop. */
+        set_pending_rtp_request(true);
         if (hls_support) {
-            url.erase();
             raop_destroy_airplay_video(raop, -1);
         }
         raop_remove_hls_connections(raop);
-        preserve_connections = true;
         remote_clock_offset = 0;
         relaunch_video = true;
         break;
@@ -2711,6 +2761,19 @@ extern "C" int video_set_codec_and_size(void *cls, video_codec_t codec, unsigned
     }
     if (!use_video) {
         return 0;
+    }
+    if (!video_renderer_wait_for_rtp(0)) {
+        LOGI("Mirror stream is waiting for the HLS-to-RTP renderer transition");
+        /* /stop normally requests this transition first.  The codec packet is
+         * also a fallback trigger if /stop was omitted, but must not enqueue a
+         * second reset once RTP initialization has already begun. */
+        if (video_renderer_is_hls()) {
+            video_reset(cls, RESET_TYPE_HLS_TO_RTP);
+        }
+        if (!video_renderer_wait_for_rtp(10000)) {
+            LOGE("RTP video renderer was not ready after 10 seconds; rejecting mirror stream");
+            return -1;
+        }
     }
     video_geometry_t geom;
     geom.width_source = (int) width_source;
@@ -3142,11 +3205,10 @@ extern "C" bool get_hls_single_variant(void *cls) {
 extern "C" void on_video_play(void *cls, const char* location, const float start_position) {
     /* start_position needs to be implemented */
     video_renderer_set_start(start_position);
-    url.erase();
-    url.append(location);
+    remote_video_session = true;
+    set_pending_hls_request(location);
     relaunch_video = true;
-    preserve_connections = true;
-    LOGI("********************on_video_play: location = %s*** start position %f ********************", url.c_str(), start_position);
+    LOGI("********************on_video_play: location = %s*** start position %f ********************", location, start_position);
     video_reset(cls, RESET_TYPE_ON_VIDEO_PLAY);
 }
 
@@ -3180,7 +3242,11 @@ extern "C" float on_video_playlist_remove (void *cls) {
 
  extern "C" void on_video_stop(void *cls) {
     LOGI("**************************on_video_stop\n");
-    video_renderer_hls_ready();
+    if (!remote_video_session.exchange(false) && !video_renderer_is_hls()) {
+        LOGD("on_video_stop: no remote video session is active");
+        return;
+    }
+    video_reset(cls, RESET_TYPE_HLS_TO_RTP);
  }
 
 extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *playback_info) {
@@ -3823,20 +3889,20 @@ int main (int argc, char *argv[]) {
     compression_type = 0;
     close_window = new_window_closing_behavior;
     main_loop();
-    if (relaunch_video) {
+    const video_request_t video_request = take_pending_video_request();
+    if (relaunch_video.load()) {
         if (reset_httpd) {
             raop_stop_httpd(raop);
         }
         if (use_audio) {
             audio_renderer_stop();
         }
-        if (use_video && (close_window || preserve_connections || full_video_reset)) {
+        if (use_video && (close_window || video_request.preserve_connections || full_video_reset)) {
             video_renderer_destroy();
-            if (!preserve_connections) {
-                url.erase();
+            if (!video_request.preserve_connections) {
                 raop_remove_known_connections(raop);
             }
-            const char *uri = (url.empty() ? NULL : url.c_str());
+            const char *uri = (video_request.url.empty() ? NULL : video_request.url.c_str());
             video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(),rtp_pipeline.c_str(),
                                 video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
                                 videosink_options.c_str(), audiosink.c_str(), fullscreen, video_sync,

@@ -61,6 +61,65 @@ static logger_t *logger = NULL;
 static bool first_packet = false;
 static bool sync = false;
 static gint hls_video = FALSE;
+
+/*
+ * Renderer lifecycle is owned by the GLib main thread, while the first mirror
+ * codec packet arrives on an RTP worker thread.  hls_video alone cannot be
+ * used as a readiness flag: video_renderer_init() changes it before the new
+ * pipelines have been constructed.  Publish a separate lifecycle state so a
+ * mirror producer can wait until the RTP consumer is completely initialized.
+ */
+typedef enum {
+    VIDEO_RENDERER_STOPPED,
+    VIDEO_RENDERER_INITIALIZING_RTP,
+    VIDEO_RENDERER_RTP_READY,
+    VIDEO_RENDERER_RTP_ACTIVE,
+    VIDEO_RENDERER_INITIALIZING_HLS,
+    VIDEO_RENDERER_HLS_READY,
+    VIDEO_RENDERER_HLS_ACTIVE,
+    VIDEO_RENDERER_DESTROYING
+} video_renderer_state_t;
+
+static GMutex renderer_state_mutex;
+static GCond renderer_state_cond;
+static video_renderer_state_t renderer_state = VIDEO_RENDERER_STOPPED;
+
+static void video_renderer_set_state(video_renderer_state_t state) {
+    g_mutex_lock(&renderer_state_mutex);
+    renderer_state = state;
+    g_cond_broadcast(&renderer_state_cond);
+    g_mutex_unlock(&renderer_state_mutex);
+}
+
+static bool video_renderer_state_is_rtp_ready(video_renderer_state_t state) {
+    return state == VIDEO_RENDERER_RTP_READY || state == VIDEO_RENDERER_RTP_ACTIVE;
+}
+
+bool video_renderer_wait_for_rtp(unsigned int timeout_ms) {
+    const gint64 deadline = g_get_monotonic_time() +
+                            ((gint64) timeout_ms * G_TIME_SPAN_MILLISECOND);
+    bool ready;
+
+    g_mutex_lock(&renderer_state_mutex);
+    while (!video_renderer_state_is_rtp_ready(renderer_state)) {
+        if (timeout_ms == 0 ||
+            !g_cond_wait_until(&renderer_state_cond, &renderer_state_mutex, deadline)) {
+            break;
+        }
+    }
+    ready = video_renderer_state_is_rtp_ready(renderer_state);
+    g_mutex_unlock(&renderer_state_mutex);
+    return ready;
+}
+
+void video_renderer_notify_rtp_ready(void) {
+    g_mutex_lock(&renderer_state_mutex);
+    if (renderer_state == VIDEO_RENDERER_INITIALIZING_RTP) {
+        renderer_state = VIDEO_RENDERER_RTP_READY;
+        g_cond_broadcast(&renderer_state_cond);
+    }
+    g_mutex_unlock(&renderer_state_mutex);
+}
 #ifdef X_DISPLAY_FIX
 static bool use_x11 = false;
 #endif
@@ -289,6 +348,7 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
     GstCaps *caps = NULL;
     bool rtp = (bool) strlen(rtp_pipeline);
     g_atomic_int_set(&hls_video, uri != NULL);
+    video_renderer_set_state(uri ? VIDEO_RENDERER_INITIALIZING_HLS : VIDEO_RENDERER_INITIALIZING_RTP);
     /* videosink choices that are auto */
     bool auto_videosink = (strstr(videosink, "autovideosink") || strstr(videosink, "fpsdisplaysink"));
     bool auto_audiosink = (strstr(audiosink, "autoaudiosink") != NULL);
@@ -536,6 +596,9 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
             exit(1);
         }
     }
+    if (video_renderer_is_hls()) {
+        video_renderer_set_state(VIDEO_RENDERER_HLS_READY);
+    }
 }
 
 void video_renderer_pause() {
@@ -570,6 +633,7 @@ void video_renderer_start() {
 	gst_element_get_state(renderer->pipeline, &state, NULL, 1000 * GST_MSECOND);
 	state_name = gst_element_state_get_name(state);
 	logger_log(logger, LOGGER_DEBUG, "video renderer_start: state %s", state_name);
+        video_renderer_set_state(VIDEO_RENDERER_HLS_ACTIVE);
         return;
     }
     // When not in HLS, do nothing (code moved to video_renderer_choose_codec_and_size(...()
@@ -730,6 +794,7 @@ void video_renderer_hls_ready() {
                    gst_element_state_change_return_get_name(ret));
         gst_element_get_state(renderer->pipeline, &state, NULL, 1000 * GST_MSECOND);
         logger_log(logger, LOGGER_DEBUG,"pipeline state is %s", gst_element_state_get_name(state));
+        video_renderer_set_state(VIDEO_RENDERER_HLS_READY);
     }
 }
 
@@ -826,6 +891,7 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
 }
 
 void video_renderer_destroy() {
+    video_renderer_set_state(VIDEO_RENDERER_DESTROYING);
     for (int i = 0; i < n_renderers; i++) {
         if (renderer_type[i]) {
             video_renderer_destroy_instance(renderer_type[i]);
@@ -833,6 +899,7 @@ void video_renderer_destroy() {
         }
     }
     renderer = NULL;
+    video_renderer_set_state(VIDEO_RENDERER_STOPPED);
 }
 
 static void get_stream_status_name(GstStreamStatusType type, char *name, size_t len) {
@@ -1113,7 +1180,11 @@ static gboolean gstreamer_video_pipeline_bus_callback(GstBus *bus, GstMessage *m
 
 int video_renderer_choose_codec_and_size (bool video_is_jpeg, bool video_is_h265, video_geometry_t *video_geometry) {
     video_renderer_t *renderer_used = NULL;
-    g_assert(!video_renderer_is_hls());
+    if (!video_renderer_wait_for_rtp(0)) {
+        logger_log(logger, LOGGER_ERR,
+                   "cannot select a mirror codec before the RTP video renderer is ready");
+        return -1;
+    }
     if (video_is_jpeg) {
         g_assert(type_jpeg != -1);
         renderer_used = renderer_type[type_jpeg];
@@ -1171,6 +1242,7 @@ int video_renderer_choose_codec_and_size (bool video_is_jpeg, bool video_is_h265
             video_renderer_destroy_instance(renderer_unused);
         }
     }
+    video_renderer_set_state(VIDEO_RENDERER_RTP_ACTIVE);
     return 0;
 }
     

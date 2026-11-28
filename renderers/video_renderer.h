@@ -72,6 +72,8 @@ void video_renderer_resume ();
 int video_renderer_cycle ();
 bool video_renderer_is_paused();
 bool video_renderer_is_hls(void);
+void video_renderer_notify_rtp_ready(void);
+bool video_renderer_wait_for_rtp(unsigned int timeout_ms);
 bool video_renderer_eos_watch();
 uint64_t  video_renderer_render_buffer (unsigned char* data, int *data_len, int *nal_count, uint64_t *ntp_time);
 void video_renderer_display_jpeg(const void *data, int *data_len);
