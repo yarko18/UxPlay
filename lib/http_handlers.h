@@ -410,21 +410,9 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
     char *type = NULL;
     bool logger_debug = (logger_get_level(raop->logger) >= LOGGER_DEBUG);
 
-    /* fetched only after the locals above are initialized: post_action_error releases them */
-    airplay_video = (airplay_video_t *) hls_get_current_video(raop);
-    if (!airplay_video) {
-        goto post_action_error;
-    }
-
     const char* session_id = http_request_get_header(request, "X-Apple-Session-ID");
     if (!session_id) {
-        logger_log(raop->logger, LOGGER_ERR, "Play request had no X-Apple-Session-ID");
-        goto post_action_error;
-    }    
-    const char *apple_session_id = get_apple_session_id(airplay_video);
-    if (strcmp(session_id, apple_session_id)){
-        logger_log(raop->logger, LOGGER_ERR, "X-Apple-Session-ID has changed:\n  was:\"%s\"\n  now:\"%s\"",
-                   apple_session_id, session_id);
+        logger_log(raop->logger, LOGGER_ERR, "Action request had no X-Apple-Session-ID");
         goto post_action_error;
     }
 
@@ -472,6 +460,22 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
     if (!PLIST_IS_DICT (req_params_node)) {
         goto post_action_error;
     }
+
+    const char *apple_session_id = NULL;
+    if (strcmp(type, "playlistInsert")) {
+        airplay_video = (airplay_video_t *) hls_get_current_video(raop);
+        if (!airplay_video) {
+            goto post_action_error;
+        }
+        apple_session_id = get_apple_session_id(airplay_video);
+        if (!apple_session_id || strcmp(session_id, apple_session_id)) {
+            logger_log(raop->logger, LOGGER_ERR,
+                       "X-Apple-Session-ID has changed:\n  was:\"%s\"\n  now:\"%s\"",
+                       apple_session_id ? apple_session_id : "(null)", session_id);
+            goto post_action_error;
+        }
+    }
+
     if (!strcmp(type,"playlistRemove")) {
         plist_t req_params_item_node = plist_dict_get_item(req_params_node, "item");
         if (!req_params_item_node || !PLIST_IS_DICT (req_params_item_node)) {
@@ -500,23 +504,36 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
             goto post_action_error;
         }
         plist_t req_params_item_uuid_node = plist_dict_get_item(req_params_item_node, "uuid");
-        char* remove_uuid = NULL;
-        plist_get_string_val(req_params_item_uuid_node, &remove_uuid);
-        if (remove_uuid) {
-            int id  =  get_playlist_by_uuid(raop, remove_uuid);
-            if (id >= 0) {
-                logger_log(raop->logger, LOGGER_INFO, "playlistInsert uuid %s is stored at airplay_video[%d]", remove_uuid, id);
-            } else {
-                logger_log(raop->logger, LOGGER_INFO, "playlistInsert uuid %s is not a stored playlist", remove_uuid);
-            }
-            plist_mem_free(remove_uuid);
-            char *plist_xml = NULL;
-            uint32_t plist_len = 0;
-            plist_to_xml(req_params_item_node, &plist_xml, &plist_len);
-            printf("playlistInsert parameter item list is:\n%s", plist_xml);
-            plist_mem_free(plist_xml);
+        if (!PLIST_IS_STRING(req_params_item_uuid_node)) {
+            goto post_action_error;
         }
-        logger_log(raop->logger, LOGGER_ERR, "FIXME: playlistInsert is not yet implemented");
+        char* insert_uuid = NULL;
+        plist_get_string_val(req_params_item_uuid_node, &insert_uuid);
+        if (!insert_uuid) {
+            goto post_action_error;
+        }
+        int id = get_playlist_by_uuid(raop, insert_uuid);
+        if (id < 0 || !get_playback_location(raop->airplay_video[id])) {
+            logger_log(raop->logger, LOGGER_WARNING,
+                       "playlistInsert uuid %s is not a stored playable playlist", insert_uuid);
+            plist_mem_free(insert_uuid);
+            goto post_action_error;
+        }
+
+        airplay_video = raop->airplay_video[id];
+        set_apple_session_id(airplay_video, session_id, strlen(session_id));
+        apple_session_id = get_apple_session_id(airplay_video);
+        raop->current_video = id;
+
+        float resume_pos = get_resume_position_seconds(airplay_video);
+        float start_pos = get_start_position_seconds(airplay_video);
+        float playback_pos = resume_pos > start_pos ? resume_pos : start_pos;
+        logger_log(raop->logger, LOGGER_INFO,
+                   "playlistInsert restored uuid %s from airplay_video[%d] at %.3f seconds",
+                   insert_uuid, id, playback_pos);
+        plist_mem_free(insert_uuid);
+        raop->callbacks.on_video_play(raop->callbacks.cls,
+                                      get_playback_location(airplay_video), playback_pos);
 
     } else if (!strcmp(type, "unhandledURLResponse")) {   
         /* handling type "unhandledURLResponse" */
